@@ -25,10 +25,16 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
 from torch.nn import functional as F
 
 from ...file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
+from ...adapters.composition import adjust_tensors_for_parallel
+from ...adapters.context import ForwardContext
+from ...adapters.lora import Linear as LoRALinear
+from ...adapters.lora import MergedLinear as LoRAMergedLinear
+from ...adapters.mixins.bloom import BloomDecoderBlockAdaptersMixin, BloomModelAdapterMixin
+from ...adapters.model_mixin import ModelWithHeadsAdaptersMixin
+# from ...adapters.prefix_tuning import PrefixTuningShim
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
-    QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
@@ -39,17 +45,17 @@ from .configuration_bloom import BloomConfig
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "bigscience/bloom-560m"
+_CHECKPOINT_FOR_DOC = "bigscience/bloom-350m"
 _CONFIG_FOR_DOC = "BloomConfig"
 _TOKENIZER_FOR_DOC = "BloomTokenizerFast"
 
 BLOOM_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "bigscience/bigscience-small-testing",
-    "bigscience/bloom-560m",
-    "bigscience/bloom-1b1",
-    "bigscience/bloom-1b7",
-    "bigscience/bloom-3b",
-    "bigscience/bloom-7b1",
+    "bigscience/bloom-350m",
+    "bigscience/bloom-760m",
+    "bigscience/bloom-1b3",
+    "bigscience/bloom-2b5",
+    "bigscience/bloom-6b3",
     "bigscience/bloom",
 ]
 
@@ -143,7 +149,7 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
             training mode
     """
     out = F.dropout(x, p=prob, training=training)
-    out = residual + out
+    # out = residual + out
     return out
 
 
@@ -232,7 +238,13 @@ class BloomAttention(nn.Module):
         self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
         self.beta = 1.0
 
-        self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
+        self.query_key_value = LoRAMergedLinear(
+                self.hidden_size,
+                3 * self.hidden_size,
+                "selfattn",
+                config,
+                bias=True
+        )
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
@@ -376,9 +388,9 @@ class BloomMLP(nn.Module):
 
         self.pretraining_tp = config.pretraining_tp
         self.slow_but_exact = config.slow_but_exact
-        self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
+        self.dense_h_to_4h = LoRALinear(hidden_size, 4 * hidden_size, "intermediate", config)
         self.gelu_impl = BloomGelu()
-        self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
+        self.dense_4h_to_h = LoRALinear(4 * hidden_size, hidden_size, "output", config)
         self.hidden_dropout = config.hidden_dropout
 
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -400,9 +412,10 @@ class BloomMLP(nn.Module):
         return output
 
 
-class BloomBlock(nn.Module):
+class BloomBlock(BloomDecoderBlockAdaptersMixin, nn.Module):
     def __init__(self, config: BloomConfig):
         super().__init__()
+        self.config = config
         hidden_size = config.hidden_size
 
         self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
@@ -414,6 +427,8 @@ class BloomBlock(nn.Module):
 
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.hidden_dropout = config.hidden_dropout
+
+        self._init_adapter_modules()
 
     def forward(
         self,
@@ -452,6 +467,8 @@ class BloomBlock(nn.Module):
 
         outputs = attn_outputs[1:]
 
+        attention_output = self.attention_adapters(attention_output, residual, None)
+
         layernorm_output = self.post_attention_layernorm(attention_output)
 
         # Get residual
@@ -462,6 +479,7 @@ class BloomBlock(nn.Module):
 
         # MLP.
         output = self.mlp(layernorm_output, residual)
+        output = self.output_adapters(output, residual, None)
 
         if use_cache:
             outputs = (output,) + outputs
@@ -581,7 +599,7 @@ BLOOM_INPUTS_DOCSTRING = r"""
     "The bare Bloom Model transformer outputting raw hidden-states without any specific head on top.",
     BLOOM_START_DOCSTRING,
 )
-class BloomModel(BloomPreTrainedModel):
+class BloomModel(BloomModelAdapterMixin, BloomPreTrainedModel):
     def __init__(self, config: BloomConfig):
         super().__init__(config)
 
@@ -599,6 +617,8 @@ class BloomModel(BloomPreTrainedModel):
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
+
+        self._init_adapter_modules()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -638,6 +658,7 @@ class BloomModel(BloomPreTrainedModel):
         output_type=BaseModelOutputWithPastAndCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
+    @ForwardContext.wrap
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -689,6 +710,7 @@ class BloomModel(BloomPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
+        inputs_embeds = self.invertible_adapters_forward(inputs_embeds)
         hidden_states = self.word_embeddings_layernorm(inputs_embeds)
 
         presents = () if use_cache else None
@@ -783,7 +805,7 @@ class BloomModel(BloomPreTrainedModel):
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForCausalLM(BloomPreTrainedModel):
+class BloomForCausalLM(ModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: BloomConfig):
@@ -946,7 +968,7 @@ class BloomForCausalLM(BloomPreTrainedModel):
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForSequenceClassification(BloomPreTrainedModel):
+class BloomForSequenceClassification(ModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: BloomConfig):
@@ -1075,7 +1097,7 @@ class BloomForSequenceClassification(BloomPreTrainedModel):
     """,
     BLOOM_START_DOCSTRING,
 )
-class BloomForTokenClassification(BloomPreTrainedModel):
+class BloomForTokenClassification(ModelWithHeadsAdaptersMixin, BloomPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: BloomConfig):
@@ -1167,96 +1189,4 @@ class BloomForTokenClassification(BloomPreTrainedModel):
             logits=logits,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-    The BLOOM Model transformer with a span classification head on top for extractive question-answering tasks like
-    SQuAD (a linear layers on top of the hidden-states output to compute `span start logits` and `span end logits`).
-    """,
-    BLOOM_START_DOCSTRING,
-)
-class BloomForQuestionAnswering(BloomPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.transformer = BloomModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(BLOOM_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
-        r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1).contiguous()
-        end_logits = end_logits.squeeze(-1).contiguous()
-
-        total_loss = None
-        if start_positions is not None and end_positions is not None:
-            # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions = start_positions.clamp(0, ignored_index)
-            end_positions = end_positions.clamp(0, ignored_index)
-
-            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-            start_loss = loss_fct(start_logits, start_positions)
-            end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
-
-        if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
-            return ((total_loss,) + output) if total_loss is not None else output
-
-        return QuestionAnsweringModelOutput(
-            loss=total_loss,
-            start_logits=start_logits,
-            end_logits=end_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
         )
