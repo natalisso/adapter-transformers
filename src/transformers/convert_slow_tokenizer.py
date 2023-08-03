@@ -1196,6 +1196,7 @@ SLOW_TO_FAST_CONVERTERS = {
     "LayoutLMv2Tokenizer": BertConverter,
     "LayoutLMv3Tokenizer": RobertaConverter,
     "LayoutXLMTokenizer": XLMRobertaConverter,
+    "LlamaTokenizer": LlamaConverter,
     "LongformerTokenizer": RobertaConverter,
     "LEDTokenizer": RobertaConverter,
     "LxmertTokenizer": BertConverter,
