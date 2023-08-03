@@ -85,6 +85,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("layoutlmv3", "LayoutLMv3Config"),
         ("led", "LEDConfig"),
         ("levit", "LevitConfig"),
+        ("llama", "LlamaConfig")
         ("lilt", "LiltConfig"),
         ("llama", "LlamaConfig"),
         ("longformer", "LongformerConfig"),
