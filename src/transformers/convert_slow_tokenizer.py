@@ -1127,8 +1127,8 @@ class LlamaConverter(SpmConverter):
             ]
         )
 
-    def pre_tokenizer(self, replacement, add_prefix_space):
-        return None
+    # def pre_tokenizer(self, replacement, add_prefix_space):
+    #     return None
 
     def post_processor(self):
         # 3 possible case :
