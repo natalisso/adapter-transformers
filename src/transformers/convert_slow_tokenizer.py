@@ -21,8 +21,7 @@ allow to make our dependency on SentencePiece optional.
 
 import warnings
 from typing import Dict, List, Tuple
-
-from tokenizers import Regex, Tokenizer, decoders, normalizers, pre_tokenizers, processors
+from tokenizers import Regex, AddedToken, Tokenizer, decoders, normalizers, pre_tokenizers, processors
 from tokenizers.models import BPE, Unigram, WordPiece
 
 from .utils import requires_backends
