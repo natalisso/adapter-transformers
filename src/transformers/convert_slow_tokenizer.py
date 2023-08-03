@@ -1042,6 +1042,95 @@ class XGLMConverter(SpmConverter):
             ],
         )
 
+class LlamaConverter(SpmConverter):
+    handle_byte_fallback = True
+
+    def vocab(self, proto):
+        vocab = [
+            ("<unk>", 0.0),
+            ("<s>", 0.0),
+            ("</s>", 0.0),
+        ]
+        vocab += [(piece.piece, piece.score) for piece in proto.pieces[3:]]
+        return vocab
+
+    def unk_id(self, proto):
+        unk_id = 0
+        return unk_id
+
+    def decoder(self, replacement, add_prefix_space):
+        return decoders.Sequence(
+            [
+                decoders.Replace("▁", " "),
+                decoders.ByteFallback(),
+                decoders.Fuse(),
+                decoders.Strip(content=" ", left=1),
+            ]
+        )
+
+    def tokenizer(self, proto):
+        model_type = proto.trainer_spec.model_type
+        vocab_scores = self.vocab(proto)
+        if model_type == 1:
+            raise RuntimeError("Llama is supposed to be a BPE model!")
+        elif model_type == 2:
+            _, merges = SentencePieceExtractor(self.original_tokenizer.vocab_file).extract(vocab_scores)
+            bpe_vocab = {word: i for i, (word, _score) in enumerate(vocab_scores)}
+            tokenizer = Tokenizer(
+                BPE(bpe_vocab, merges, unk_token=proto.trainer_spec.unk_piece, fuse_unk=True, byte_fallback=True)
+            )
+            tokenizer.add_special_tokens(
+                [
+                    AddedToken("<unk>"),
+                    AddedToken("<s>"),
+                    AddedToken("</s>"),
+                ]
+            )
+        else:
+            raise Exception(
+                "You're trying to run a `Unigram` model but you're file was trained with a different algorithm"
+            )
+
+        return tokenizer
+
+    def normalizer(self, proto):
+        return normalizers.Sequence(
+            [
+                normalizers.Prepend(prepend="▁"),
+                normalizers.Replace(pattern=" ", content="▁"),
+            ]
+        )
+
+    def pre_tokenizer(self, replacement, add_prefix_space):
+        return None
+
+    def post_processor(self):
+        # 3 possible case :
+        # - add_bos and add_eos : '<s>:0 $A:0 </s>:0' and '<s>:0 $A:0 </s>:0 <s>:1 $B:1 </s>:1'
+        # - add_bos: '<s>:0 $A:0' and '<s>:0 $A:0 <s>:1 $B:1'
+        # - add_eos: '$A:0 </s>:0' and '$A:0 </s>:0 $B:1 </s>:1'
+
+        add_bos = self.original_tokenizer.add_bos_token
+        add_eos = self.original_tokenizer.add_eos_token
+        if add_bos or add_eos:
+            bos = self.original_tokenizer.bos_token
+            bos_token_id = self.original_tokenizer.bos_token_id
+
+            eos = self.original_tokenizer.eos_token
+            eos_token_id = self.original_tokenizer.eos_token_id
+
+            single = f"{(bos+':0 ') * add_bos}$A:0{(' '+eos+':0') * add_eos}"
+            pair = f"{single}{(' '+bos+':1') * add_bos} $B:1{(' '+eos+':1') * add_eos}"
+
+            special_tokens = []
+            if add_bos:
+                special_tokens.append((bos, bos_token_id))
+            if add_eos:
+                special_tokens.append((eos, eos_token_id))
+            return processors.TemplateProcessing(single=single, pair=pair, special_tokens=special_tokens)
+
+        else:
+            return None
 
 class MarkupLMConverter(Converter):
     def converted(self) -> Tokenizer:
